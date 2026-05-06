@@ -76,6 +76,7 @@ class CoreContext:
         self.hbm = hbm  # Shared HBM
         self._scope_stack: List[Dict[str, Any]] = [{}]  # bottom = function body
         self._lx_bytes: Dict[str, int] = {}  # SSA name -> LX bytes (single source of truth)
+        self._lx_next_ptr_stack: List[int] = []  # watermarks saved on push_scope, restored on pop_scope (#26)
 
     def get_grid_id(self, dim: int) -> int:
         """Get grid ID for dimension.
@@ -93,20 +94,28 @@ class CoreContext:
     # ------------------------------------------------------------------
 
     def push_scope(self):
-        """Enter a new region scope (scf.for body, scf.if branch)."""
+        """Enter a new region scope (scf.for body, scf.if branch).
+
+        Snapshots ``lx.next_ptr`` so ``pop_scope`` can rewind it and
+        keep the bump-pointer in lockstep with ``lx.used`` (see #26).
+        """
+        self._lx_next_ptr_stack.append(self.lx.next_ptr)
         self._scope_stack.append({})
 
     def pop_scope(self):
         """Exit the current region scope.
 
-        Discards all SSA values in the topmost scope and frees their
-        LX via ``untrack_lx``.
+        Discards all SSA values in the topmost scope, frees their LX
+        via ``untrack_lx``, and rewinds ``lx.next_ptr`` to its
+        pre-push value so the bump-pointer reclaims address space
+        alongside the byte counter.
         """
         if len(self._scope_stack) <= 1:
             raise RuntimeError("Cannot pop the function-body scope")
         scope = self._scope_stack.pop()
         for name in scope:
             self.untrack_lx(name)
+        self.lx.next_ptr = self._lx_next_ptr_stack.pop()
 
     # ------------------------------------------------------------------
     # SSA value access
@@ -148,6 +157,7 @@ class CoreContext:
         """Clear all scopes and LX (for next round of execution)."""
         self._scope_stack = [{}]
         self._lx_bytes.clear()
+        self._lx_next_ptr_stack.clear()
         self.lx.clear()
 
     # ------------------------------------------------------------------
