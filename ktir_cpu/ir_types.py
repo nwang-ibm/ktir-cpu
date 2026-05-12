@@ -103,14 +103,65 @@ class TileRef:
 
 
 @dataclass
+class DistributedTileRef:
+    """Composite memory layout combining several per-partition TileRefs.
+
+    Produced by ``ktdp.construct_distributed_memory_view``.  Each partition
+    is a plain :class:`TileRef` carrying its own ``coordinate_set`` (in
+    global coords), ``memory_space``, ``base_ptr``, and ``strides``; this
+    wrapper records the global logical shape and dispatches a global
+    coordinate to the first partition whose set contains it.
+
+    The op does not allocate or move data — this is bookkeeping only.
+    Load/store resolution happens in ``MemoryOps.load_distributed`` /
+    ``store_distributed`` (see RFC 0682 §3.3).
+    """
+    partitions: List[TileRef]
+    shape: Tuple[int, ...]       # global logical shape
+    dtype: str
+
+    def __post_init__(self):
+        if not self.partitions:
+            raise ValueError("DistributedTileRef requires at least one partition")
+        for i, p in enumerate(self.partitions):
+            if p.coordinate_set is None:
+                raise ValueError(
+                    f"DistributedTileRef partition {i} must have a coordinate_set"
+                )
+            if p.dtype != self.dtype:
+                raise ValueError(
+                    f"DistributedTileRef partition {i} dtype {p.dtype!r} "
+                    f"does not match view dtype {self.dtype!r}"
+                )
+
+    def find_partition(self, coord: Tuple[int, ...]) -> Tuple[int, "TileRef"]:
+        """Return ``(index, partition)`` whose coordinate_set contains *coord*.
+
+        Returns the first match; per RFC 0682 §3.3, overlapping coordinate
+        sets produce unspecified behavior, and "first match" is a legal
+        (and conveniently deterministic) resolution.
+        """
+        for i, p in enumerate(self.partitions):
+            if p.coordinate_set.contains(coord):
+                return i, p
+        raise IndexError(
+            f"No partition of DistributedTileRef contains global coord {coord}"
+        )
+
+
+@dataclass
 class AccessTile:
     """Coordinate access tile referencing a sub-region of a TileRef.
 
     Holds the affine attributes that describe which coordinates of the
     parent memref to access.  Load and store operations use these to
     find the actual memory location.
+
+    ``parent_ref`` may be either a plain :class:`TileRef` or a
+    :class:`DistributedTileRef`; routing to a specific partition is
+    deferred to load/store time.
     """
-    parent_ref: TileRef
+    parent_ref: Union[TileRef, "DistributedTileRef"]
     shape: Tuple[int, ...]
     base_map: AffineMap                                  # always present; synthesized as identity if absent in MLIR
     coordinate_set: Optional[AffineSet] = None     # parsed access_tile_set; None if omitted

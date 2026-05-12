@@ -2,8 +2,23 @@
 // This is an example program to illustrate the use of ktdp.construct_distributed_memory_view.
 // The program copies a distributed tensor A (partitioned across HBM and two LX scratchpads)
 // into a contiguous output tensor B on HBM.
-// NOTE: Copied from KTIR-V1.ppt slide 9 - construct distributed memory view
-// NOTE: Minor correction #ktpd.spyre_memory_space<LX0> -> LX
+// NOTE: Copied from KTIR-V1.ppt slide 9 - construct distributed memory view.
+// NOTE: Minor correction #ktpd.spyre_memory_space<LX0> -> LX.
+// NOTE: The two LX partitions are tagged with distinct `core = N` indices
+//       per the KTDP ODS `#ktdp.spyre_memory_space<LX, core = N>` form
+//       (KernelTileIR/src/Dialects/KTDP/KTDPOps.td:68-104).  In real hardware
+//       each compute core has its own private LX SRAM, so A_LX0's and
+//       A_LX1's byte-address spaces are independent and both bases could
+//       naturally be 0 (a common layout in real kernels).
+// NOTE: Simulator caveat — ktir-cpu does not yet honor the `core = N`
+//       index: every `<LX, core = *>` memref resolves to the currently
+//       executing core's single scratchpad.  Within that one LX dict the
+//       two partition footprints must not overlap.  A_LX0's strides [1, 64]
+//       over shape (32, 64) give a max element offset of 31+63*64 = 4063,
+//       so its strided footprint reaches byte 20416 from base 12288 —
+//       hence A_LX1_addr = 20480 here (the slide's 16384 would alias
+//       A_LX0's second-half reads and return A_LX1's data).  Once per-core
+//       LX routing lands, all three partition bases can collapse to 0.
 
 // A is a 192x64 logical tensor partitioned across three memory spaces:
 //   A_HBM  = rows   0..95,  stored on HBM,  row-major    (96x64)
@@ -26,7 +41,7 @@ module {
         // In this example, A is distributed across HBM and two LX scratchpads; B is on HBM
         %A_HBM_addr = arith.constant 0       : index
         %A_LX0_addr = arith.constant 12288   : index
-        %A_LX1_addr = arith.constant 16384   : index
+        %A_LX1_addr = arith.constant 20480   : index
         %B_addr     = arith.constant 24576   : index
 
         // Accessing a tensor in KTIR follows a 3 step process:
@@ -51,12 +66,12 @@ module {
         // Note: column-major layout expressed via strides [1, 64]
         %A_LX0_view = ktdp.construct_memory_view %A_LX0_addr, sizes: [32, 64], strides: [1, 64] {
             coordinate_set = #A_LX0_coord_set,
-            memory_space = #ktdp.spyre_memory_space<LX>
+            memory_space = #ktdp.spyre_memory_space<LX, core = 0>
         } : memref<32x64xf16>
 
         %A_LX1_view = ktdp.construct_memory_view %A_LX1_addr, sizes: [64, 64], strides: [64, 1] {
             coordinate_set = #A_LX1_coord_set,
-            memory_space = #ktdp.spyre_memory_space<LX>
+            memory_space = #ktdp.spyre_memory_space<LX, core = 1>
         } : memref<64x64xf16>
 
         // (1) Compose the three partition views into a single logical distributed view of shape 192x64

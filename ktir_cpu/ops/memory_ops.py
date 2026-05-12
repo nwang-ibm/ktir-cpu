@@ -19,14 +19,36 @@ Tile view construction, sub-tile access, and HBM/LX load/store
 primitives used by dialect handlers in ``ktir_cpu.dialects``.
 """
 
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 import numpy as np
-from ..affine import AffineMap
+from ..affine import AffineMap, AffineSet
 from ..dialects.ktdp_helpers import eval_subscript_expr
-from ..dtypes import bytes_per_elem as _bytes_per_elem
-from ..ir_types import Tile, TileRef
+from ..dtypes import bytes_per_elem as _bytes_per_elem, to_np_dtype as _to_np_dtype
+from ..ir_types import Tile, TileRef, DistributedTileRef
 from ..grid import CoreContext
 from ..memory import HBMSimulator
+
+
+def partition_origin(coord_set: AffineSet, global_shape: Tuple[int, ...]) -> Tuple[int, ...]:
+    """Find the per-dim minimum global coordinate covered by *coord_set*.
+
+    For an axis-aligned rectangular partition (the common case expressed
+    by affine sets like ``d_i - C >= 0, -d_i + D >= 0``), this is the
+    partition's origin in the global index space, so
+    ``local_coord[i] = global_coord[i] - origin[i]``.
+
+    Works for any convex set shape by enumerating points within
+    *global_shape* and taking the per-dim min; callers should cache the
+    result per distributed view.
+    """
+    points = coord_set.enumerate(global_shape)
+    if not points:
+        raise ValueError(
+            f"Partition coordinate_set is empty over shape {global_shape}: "
+            f"{coord_set.source!r}"
+        )
+    ndim = len(global_shape)
+    return tuple(min(p[i] for p in points) for i in range(ndim))
 
 
 class MemoryOps:
@@ -275,6 +297,104 @@ class MemoryOps:
         flat = mem.read(tile_ref.base_ptr, span, tile_ref.dtype)
         flat[offsets] = tile.data.flatten()
         mem.write(tile_ref.base_ptr, flat)
+
+    @staticmethod
+    def _group_by_partition(
+        dist_ref: DistributedTileRef,
+        coords: List[Tuple[int, ...]],
+    ) -> Dict[int, Tuple[List[int], List[Tuple[int, ...]]]]:
+        """Route each global coord to a partition and translate to local.
+
+        Returns ``{partition_idx: (orig_positions, local_coords)}``.
+        ``orig_positions[k]`` is the index into *coords* that produced
+        ``local_coords[k]`` — used to scatter per-partition results back
+        into a single flat output.
+
+        Per-partition origins are computed lazily (and only once) from
+        each partition's ``coordinate_set`` via :func:`partition_origin`.
+        """
+        ndim = len(dist_ref.shape)
+        origins: Dict[int, Tuple[int, ...]] = {}
+        groups: Dict[int, Tuple[List[int], List[Tuple[int, ...]]]] = {}
+        for pos, coord in enumerate(coords):
+            part_idx, part = dist_ref.find_partition(coord)
+            if part_idx not in origins:
+                origins[part_idx] = partition_origin(part.coordinate_set, dist_ref.shape)
+            origin = origins[part_idx]
+            local = tuple(int(coord[d] - origin[d]) for d in range(ndim))
+            pos_list, local_list = groups.setdefault(part_idx, ([], []))
+            pos_list.append(pos)
+            local_list.append(local)
+        return groups
+
+    @staticmethod
+    def load_distributed(
+        context: CoreContext,
+        dist_ref: DistributedTileRef,
+        coords: List[Tuple[int, ...]],
+        result_shape: Optional[Tuple[int, ...]] = None,
+    ) -> Tile:
+        """Gather elements from a distributed view, route per partition.
+
+        For each global coord, pick the partition whose ``coordinate_set``
+        contains it, translate to that partition's local coord, issue one
+        batched read per partition group, and scatter results back into a
+        single flat output indexed by the coord's original position.
+        Writes the result to LX and returns a :class:`Tile` so the caller
+        sees the same contract as :meth:`load`.
+        """
+        out_shape = result_shape if result_shape is not None else tuple(dist_ref.shape)
+        n_total = len(coords)
+        np_dtype_output = np.zeros(n_total, dtype=_to_np_dtype(dist_ref.dtype))
+
+        groups = MemoryOps._group_by_partition(dist_ref, coords)
+
+        total_unique_sticks = 0
+        for part_idx, (orig_positions, local_coords) in groups.items():
+            part = dist_ref.partitions[part_idx]
+            mem = context.hbm if part.memory_space == "HBM" else context.lx
+            offsets, unique_sticks = MemoryOps._flat_memory_offsets(
+                part.base_ptr, part.shape, part.strides, part.dtype, local_coords
+            )
+            span = max(offsets) + 1 if offsets else 1
+            flat = mem.read(part.base_ptr, span, part.dtype)
+            gathered = flat[offsets]
+            # Scatter this partition's values back into their original positions.
+            np_dtype_output[orig_positions] = gathered
+            # TODO: stick counting across mixed memory spaces is approximate;
+            # HBM partitions contribute real DMA traffic, LX partitions don't.
+            total_unique_sticks += unique_sticks
+
+        data = np_dtype_output.reshape(out_shape)
+        MemoryOps._write_to_lx(context, data)
+        return Tile(data, dist_ref.dtype, out_shape, total_unique_sticks)
+
+    @staticmethod
+    def store_distributed(
+        context: CoreContext,
+        tile: Tile,
+        dist_ref: DistributedTileRef,
+        coords: List[Tuple[int, ...]],
+    ) -> None:
+        """Scatter a tile across a distributed view, route per partition.
+
+        Symmetric to :meth:`load_distributed`: group scatter positions by
+        partition, then do one read-modify-write per partition using the
+        existing ``_flat_memory_offsets`` machinery.
+        """
+        groups = MemoryOps._group_by_partition(dist_ref, coords)
+        flat_values = tile.data.flatten()
+
+        for part_idx, (orig_positions, local_coords) in groups.items():
+            part = dist_ref.partitions[part_idx]
+            mem = context.hbm if part.memory_space == "HBM" else context.lx
+            offsets, _ = MemoryOps._flat_memory_offsets(
+                part.base_ptr, part.shape, part.strides, part.dtype, local_coords
+            )
+            span = max(offsets) + 1 if offsets else 1
+            flat = mem.read(part.base_ptr, span, part.dtype)
+            flat[offsets] = flat_values[orig_positions]
+            mem.write(part.base_ptr, flat)
 
     @staticmethod
     def indirect_load(
