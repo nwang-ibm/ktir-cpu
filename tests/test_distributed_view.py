@@ -759,3 +759,180 @@ def test_distributed_tile_access_slow_path(case_id, indices, expected):
         assert pts_got == _expected_points(exp_lo, exp_hi), (
             f"{case_id}: C_i mismatch for partition at origin {origin_got}"
         )
+
+
+# ---------------------------------------------------------------------------
+# distributed_store fast path: writes touch ONLY the C_i rectangle
+#
+# The sub-TileRef construction in distributed_store inherits the parent's
+# strides verbatim and shifts base_ptr to the box's local origin.  A bug in
+# either of those (wrong stride, wrong byte offset, wrong sub-shape) could
+# silently overwrite memory adjacent to C_i — outside the rectangle but
+# still inside the partition's allocation.  test_distributed_copy doesn't
+# catch this: it only reads back the access-tile region, so trampled data
+# elsewhere goes unnoticed.
+#
+# These tests seed the WHOLE partition with a sentinel pattern, run a
+# distributed_store that touches only a small C_i sub-rectangle, and then
+# inspect every byte: C_i must hold the new data; every other byte must
+# still be the sentinel.  Two cases exercise the row-major and
+# column-packed stride layouts.
+# ---------------------------------------------------------------------------
+
+def test_distributed_store_does_not_trample_outside_C_i():
+    """Row-major partition: distributed_store must not write outside C_i."""
+    from ktir_cpu.affine import BoxSet
+    from ktir_cpu.dtypes import bytes_per_elem
+    from ktir_cpu.grid import CoreContext
+    from ktir_cpu.ir_types import DistributedTileRef, Tile, TileRef
+    from ktir_cpu.memory import HBMSimulator, LXScratchpad
+    from ktir_cpu.ops.memory_ops import MemoryOps
+    from ktir_cpu.parser_ast import parse_affine_map, parse_affine_set
+
+    PART_SHAPE = (8, 16)
+    NCOLS = 16
+    DTYPE = "f16"
+    bpe = bytes_per_elem(DTYPE)
+    elems_per_part = PART_SHAPE[0] * PART_SHAPE[1]
+    bytes_per_part = elems_per_part * bpe
+
+    P0_BASE = 0
+    P1_BASE = bytes_per_part
+    SENTINEL = np.float16(-7.0)
+
+    hbm = HBMSimulator(size_gb=1)
+    hbm.write(P0_BASE, np.full(2 * elems_per_part, SENTINEL, dtype=np.float16))
+    ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0),
+                      lx=LXScratchpad(size_mb=1, core_id=0), hbm=hbm)
+
+    # Box-form coordinate sets → BoxSet via parse-time lowering.
+    B0 = parse_affine_set("affine_set<(d0, d1) : (d0 >= 0, -d0 + 7 >= 0, d1 >= 0, -d1 + 15 >= 0)>")
+    B1 = parse_affine_set("affine_set<(d0, d1) : (d0 - 8 >= 0, -d0 + 15 >= 0, d1 >= 0, -d1 + 15 >= 0)>")
+    assert isinstance(B0, BoxSet) and isinstance(B1, BoxSet)
+
+    P0 = TileRef(base_ptr=P0_BASE, shape=PART_SHAPE, strides=[NCOLS, 1],
+                 memory_space="HBM", dtype=DTYPE, coordinate_set=B0)
+    P1 = TileRef(base_ptr=P1_BASE, shape=PART_SHAPE, strides=[NCOLS, 1],
+                 memory_space="HBM", dtype=DTYPE, coordinate_set=B1)
+    dist = DistributedTileRef(partitions=[P0, P1], shape=(16, 16),
+                              dtype=DTYPE, global_base=(0, 0))
+
+    # 4×4 access at (2, 4) — fully inside P0; C_i = [2,6) × [4,8).
+    access_shape = (4, 4)
+    indices = (2, 4)
+    base_map = parse_affine_map("affine_map<(d0, d1) -> (d0, d1)>")
+    resolved = MemoryOps.distributed_tile_access(
+        dist_ref=dist, access_shape=access_shape, base_map=base_map,
+        indices=list(indices), access_tile_set=None,
+    )
+    assert len(resolved.partitions) == 1, "P1 should be pruned"
+    assert isinstance(resolved.partitions[0].coordinate_set, BoxSet)
+    assert resolved.partitions[0].coordinate_set == BoxSet(lo=(2, 4), hi=(6, 8))
+
+    payload_values = np.arange(1, 17, dtype=np.float16).reshape(4, 4)
+    MemoryOps.distributed_store(ctx, Tile(payload_values, DTYPE, access_shape), resolved)
+
+    p0_full = hbm.read(P0_BASE, elems_per_part, DTYPE).reshape(PART_SHAPE)
+    p1_full = hbm.read(P1_BASE, elems_per_part, DTYPE).reshape(PART_SHAPE)
+
+    # P1 entirely untouched (was pruned, must not have been visited).
+    assert np.all(p1_full == SENTINEL), \
+        "P1 was trampled — distributed_store wrote outside the surviving partition"
+
+    # Inside C_i: payload data.  Outside C_i: still sentinel.
+    c_i_slice = (slice(2, 6), slice(4, 8))
+    np.testing.assert_array_equal(
+        p0_full[c_i_slice], payload_values,
+        err_msg="C_i sub-rectangle of P0 has wrong values",
+    )
+    mask = np.zeros(PART_SHAPE, dtype=bool)
+    mask[c_i_slice] = True
+    outside = p0_full[~mask]
+    assert np.all(outside == SENTINEL), (
+        f"P0 has {(outside != SENTINEL).sum()} cell(s) outside C_i that "
+        f"differ from the sentinel — distributed_store trampled neighbouring "
+        f"memory."
+    )
+
+
+def test_distributed_store_col_packed_does_not_trample_outside_C_i():
+    """Column-packed partition (strides=[1, R]): same trample check.
+
+    Stresses the sub-TileRef stride-inheritance claim: the sub-tile must
+    reuse the parent's strides=[1, R], not synthesise row-major strides
+    for its own sub-shape.  A bug there would scatter the written data
+    across column-packed memory and trample sentinels outside C_i.
+    """
+    from ktir_cpu.affine import BoxSet
+    from ktir_cpu.dtypes import bytes_per_elem
+    from ktir_cpu.grid import CoreContext
+    from ktir_cpu.ir_types import DistributedTileRef, Tile, TileRef
+    from ktir_cpu.memory import HBMSimulator, LXScratchpad
+    from ktir_cpu.ops.memory_ops import MemoryOps
+    from ktir_cpu.parser_ast import parse_affine_map, parse_affine_set
+
+    PART_SHAPE = (8, 16)
+    NROWS = 8
+    DTYPE = "f16"
+    bpe = bytes_per_elem(DTYPE)
+    elems_per_part = PART_SHAPE[0] * PART_SHAPE[1]
+    bytes_per_part = elems_per_part * bpe
+
+    P0_BASE = 0
+    P1_BASE = bytes_per_part
+    SENTINEL = np.float16(99.0)
+
+    hbm = HBMSimulator(size_gb=1)
+    hbm.write(P0_BASE, np.full(2 * elems_per_part, SENTINEL, dtype=np.float16))
+    ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0),
+                      lx=LXScratchpad(size_mb=1, core_id=0), hbm=hbm)
+
+    B0 = parse_affine_set("affine_set<(d0, d1) : (d0 >= 0, -d0 + 7 >= 0, d1 >= 0, -d1 + 15 >= 0)>")
+    B1 = parse_affine_set("affine_set<(d0, d1) : (d0 - 8 >= 0, -d0 + 15 >= 0, d1 >= 0, -d1 + 15 >= 0)>")
+    assert isinstance(B0, BoxSet) and isinstance(B1, BoxSet)
+
+    # strides=[1, NROWS] → column-packed: element (r, c) at offset r + c*NROWS.
+    P0 = TileRef(base_ptr=P0_BASE, shape=PART_SHAPE, strides=[1, NROWS],
+                 memory_space="HBM", dtype=DTYPE, coordinate_set=B0)
+    P1 = TileRef(base_ptr=P1_BASE, shape=PART_SHAPE, strides=[1, NROWS],
+                 memory_space="HBM", dtype=DTYPE, coordinate_set=B1)
+    dist = DistributedTileRef(partitions=[P0, P1], shape=(16, 16),
+                              dtype=DTYPE, global_base=(0, 0))
+
+    access_shape = (4, 4)
+    indices = (2, 4)
+    base_map = parse_affine_map("affine_map<(d0, d1) -> (d0, d1)>")
+    resolved = MemoryOps.distributed_tile_access(
+        dist_ref=dist, access_shape=access_shape, base_map=base_map,
+        indices=list(indices), access_tile_set=None,
+    )
+    assert len(resolved.partitions) == 1
+    assert isinstance(resolved.partitions[0].coordinate_set, BoxSet)
+
+    payload_values = np.arange(1, 17, dtype=np.float16).reshape(4, 4)
+    MemoryOps.distributed_store(ctx, Tile(payload_values, DTYPE, access_shape), resolved)
+
+    p0_flat = hbm.read(P0_BASE, elems_per_part, DTYPE)
+    p1_flat = hbm.read(P1_BASE, elems_per_part, DTYPE)
+
+    # P1 entirely untouched.
+    assert np.all(p1_flat == SENTINEL), "P1 was trampled (col-packed case)"
+
+    # Reconstruct P0's logical grid via the column-packed strides.
+    p0_logical = np.empty(PART_SHAPE, dtype=np.float16)
+    for r in range(PART_SHAPE[0]):
+        for c in range(PART_SHAPE[1]):
+            p0_logical[r, c] = p0_flat[r * 1 + c * NROWS]
+
+    c_i_slice = (slice(2, 6), slice(4, 8))
+    np.testing.assert_array_equal(
+        p0_logical[c_i_slice], payload_values,
+        err_msg="C_i sub-rectangle has wrong values (col-packed)",
+    )
+    mask = np.zeros(PART_SHAPE, dtype=bool)
+    mask[c_i_slice] = True
+    outside = p0_logical[~mask]
+    assert np.all(outside == SENTINEL), (
+        f"P0 col-packed: {(outside != SENTINEL).sum()} cell(s) outside C_i "
+        f"differ from sentinel — strides inheritance is broken."
+    )
