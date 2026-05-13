@@ -403,6 +403,32 @@ class MemoryOps:
         )
 
     @staticmethod
+    def _subtile_ref(part: TileRef, box: "BoxSet", partition_origin: Tuple[int, ...]) -> TileRef:
+        """Build a TileRef covering exactly the sub-rectangle ``box`` within ``part``.
+
+        The sub-tile inherits the parent's strides verbatim — only ``shape``
+        shrinks to the box extent and ``base_ptr`` shifts to the box's local
+        origin.  This way ``MemoryOps.load``/``store``'s strided iteration
+        lands each ``(r, c, ...)`` element at the byte offset its parent
+        layout dictates, with no transpose or permutation needed on the
+        caller side: a row-major source NumPy slice writes correctly even
+        into a column-packed partition because the destination strides
+        re-route each element to its proper address.
+        """
+        ndim = len(part.shape)
+        local_lo = tuple(box.lo[d] - partition_origin[d] for d in range(ndim))
+        sub_shape = tuple(box.hi[d] - box.lo[d] for d in range(ndim))
+        bpe = _bytes_per_elem(part.dtype)
+        byte_offset = sum(local_lo[d] * part.strides[d] for d in range(ndim)) * bpe
+        return TileRef(
+            base_ptr=part.base_ptr + byte_offset,
+            shape=sub_shape,
+            strides=list(part.strides),
+            memory_space=part.memory_space,
+            dtype=part.dtype,
+        )
+
+    @staticmethod
     def distributed_load(
         context: CoreContext,
         dist_ref: DistributedTileRef,
@@ -411,35 +437,45 @@ class MemoryOps:
         """Load from a pre-resolved DistributedTileRef (output of distributed_tile_access).
 
         Iterates surviving partitions directly. For each partition:
-        - Fast path: coordinate_set covers the full partition shape → bulk read,
-          rectangular assign into the output array.
-        - Slow path: partial coverage → enumerate local coords, gather, scatter.
+        - BoxSet fast path: load just the C_i sub-rectangle via a sub-TileRef
+          (inherits parent strides; only base_ptr and shape change), then
+          assign as a rectangular slice into the output.
+        - Slow path (pre-enumerated point list): gather load_coords, scatter
+          into flat_out.
         """
         ndim = len(dist_ref.shape)
         global_base = dist_ref.global_base or (0,) * ndim
         out_shape = result_shape if result_shape is not None else tuple(dist_ref.shape)
         out = np.zeros(out_shape, dtype=_to_np_dtype(dist_ref.dtype))
+        flat_out = out.reshape(-1)
         total_unique_sticks = 0
 
         for part in dist_ref.partitions:
-            # coordinate_set is either a BoxSet (distributed fast path) or a
-            # pre-enumerated point list (slow path), set by distributed_tile_access.
             cs = part.coordinate_set
-            C_i_pts = cs.enumerate() if isinstance(cs, BoxSet) else cs
             p_i = part.partition_origin
             x = global_base
 
-            # load_coords: C_i - p_i  (local offsets within partition memory)
-            # out_coords:  C_i - x    (local offsets within output array)
-            load_coords = [tuple(pt[d] - p_i[d] for d in range(ndim)) for pt in C_i_pts]
-            out_coords  = [tuple(pt[d] - x[d]   for d in range(ndim)) for pt in C_i_pts]
+            if isinstance(cs, BoxSet):
+                # Fast path: read just C_i via a sub-TileRef and assign to a
+                # rectangular slice of the output.
+                sub_ref = MemoryOps._subtile_ref(part, cs, p_i)
+                tile = MemoryOps.load(context, sub_ref)
+                total_unique_sticks += tile.unique_sticks or 0
+                out_slice = tuple(
+                    slice(cs.lo[d] - x[d], cs.hi[d] - x[d]) for d in range(ndim)
+                )
+                out[out_slice] = tile.data
+            else:
+                # Slow path: pre-enumerated point list (non-axis-aligned C_i).
+                C_i_pts = cs
+                load_coords = [tuple(pt[d] - p_i[d] for d in range(ndim)) for pt in C_i_pts]
+                out_coords  = [tuple(pt[d] - x[d]   for d in range(ndim)) for pt in C_i_pts]
 
-            tile = MemoryOps.load(context, part, coords=load_coords, result_shape=(len(load_coords),))
-            total_unique_sticks += tile.unique_sticks or 0
+                tile = MemoryOps.load(context, part, coords=load_coords, result_shape=(len(load_coords),))
+                total_unique_sticks += tile.unique_sticks or 0
 
-            flat_out = out.reshape(-1)
-            out_indices = [sum(c[d] * int(np.prod(out_shape[d+1:])) for d in range(ndim)) for c in out_coords]
-            flat_out[out_indices] = tile.data.flatten()
+                out_indices = [sum(c[d] * int(np.prod(out_shape[d+1:])) for d in range(ndim)) for c in out_coords]
+                flat_out[out_indices] = tile.data.flatten()
 
         MemoryOps._write_to_lx(context, out)
         return Tile(out, dist_ref.dtype, out_shape, total_unique_sticks)
@@ -452,28 +488,44 @@ class MemoryOps:
     ) -> None:
         """Store to a pre-resolved DistributedTileRef (output of distributed_tile_access).
 
-        Symmetric to load_distributed: slice the input tile per partition and
-        store each slice to its partition's memory.
+        For each partition:
+        - BoxSet fast path: slice the C_i sub-rectangle from the input tile
+          and store it through a sub-TileRef whose strides match the parent —
+          MemoryOps.store routes each element to the right byte offset for
+          the partition's layout, no permutation needed.
+        - Slow path (pre-enumerated point list): per-element gather + scatter.
         """
         ndim = len(dist_ref.shape)
         global_base = dist_ref.global_base or (0,) * ndim
 
         for part in dist_ref.partitions:
-            # coordinate_set is either a BoxSet (distributed fast path) or a
-            # pre-enumerated point list (slow path), set by distributed_tile_access.
             cs = part.coordinate_set
-            C_i_pts = cs.enumerate() if isinstance(cs, BoxSet) else cs
             p_i = part.partition_origin
             x = global_base
 
-            load_coords = [tuple(pt[d] - p_i[d] for d in range(ndim)) for pt in C_i_pts]
-            out_coords  = [tuple(pt[d] - x[d]   for d in range(ndim)) for pt in C_i_pts]
+            if isinstance(cs, BoxSet):
+                # Fast path: source slice is a rectangular view of `tile`,
+                # destination is a sub-TileRef of the partition.
+                src_slice = tuple(
+                    slice(cs.lo[d] - x[d], cs.hi[d] - x[d]) for d in range(ndim)
+                )
+                src_block = np.ascontiguousarray(
+                    tile.data[src_slice], dtype=_to_np_dtype(part.dtype)
+                )
+                sub_shape = tuple(cs.hi[d] - cs.lo[d] for d in range(ndim))
+                sub_ref = MemoryOps._subtile_ref(part, cs, p_i)
+                MemoryOps.store(context, Tile(src_block, part.dtype, sub_shape), sub_ref)
+            else:
+                # Slow path: pre-enumerated point list (non-axis-aligned C_i).
+                C_i_pts = cs
+                load_coords = [tuple(pt[d] - p_i[d] for d in range(ndim)) for pt in C_i_pts]
+                out_coords  = [tuple(pt[d] - x[d]   for d in range(ndim)) for pt in C_i_pts]
 
-            flat_in = tile.data.reshape(-1)
-            in_indices = [sum(c[d] * int(np.prod(tile.shape[d+1:])) for d in range(ndim)) for c in out_coords]
-            part_data = np.array([flat_in[i] for i in in_indices], dtype=_to_np_dtype(part.dtype))
-            part_tile = Tile(part_data, part.dtype, (len(load_coords),))
-            MemoryOps.store(context, part_tile, part, coords=load_coords)
+                flat_in = tile.data.reshape(-1)
+                in_indices = [sum(c[d] * int(np.prod(tile.shape[d+1:])) for d in range(ndim)) for c in out_coords]
+                part_data = np.array([flat_in[i] for i in in_indices], dtype=_to_np_dtype(part.dtype))
+                part_tile = Tile(part_data, part.dtype, (len(load_coords),))
+                MemoryOps.store(context, part_tile, part, coords=load_coords)
 
     @staticmethod
     def indirect_load(

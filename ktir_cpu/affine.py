@@ -75,6 +75,19 @@ Which op uses which class
     Slow path (either side is ``AffineSet``): brute-force ``B_i.enumerate``
     and filter; stores the enumerated ``List[Tuple[int, ...]]``.
 
+- ``ktdp.load`` / ``ktdp.store`` via ``distributed_load``/``distributed_store``:
+    When ``coordinate_set`` is a ``BoxSet``, build a sub-``TileRef``
+    covering exactly ``C_i`` (inherits parent strides; ``base_ptr``
+    shifts to the box's local origin, ``shape`` shrinks to the box
+    extent) and round-trip through ``MemoryOps.load``/``store`` with
+    ``coords=None``.  No per-point coord list, no scatter loop — the
+    output side is a single rectangular NumPy slice assignment.  The
+    parent's strides route each element to the right byte address, so
+    row-major and column-packed partitions both work without any
+    transpose on the caller.  When ``coordinate_set`` is a
+    ``List[Tuple[...]]`` (slow-path slow path), falls through to the
+    pre-existing per-point gather/scatter.
+
 - ``ktdp.load`` / ``ktdp.store``:
     Call ``css.enumerate(access_tile.shape)`` where ``css`` is either
     ``BoxSet`` or ``AffineSet``.  ``BoxSet.enumerate`` accepts ``shape``
