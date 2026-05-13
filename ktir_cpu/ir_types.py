@@ -87,7 +87,15 @@ class TileRef:
     strides: List[int]
     memory_space: str  # "HBM" or "LX"
     dtype: str = "f16"
-    coordinate_set: Optional[AffineSet] = None  # parsed; None if omitted in MLIR
+    # coordinate_set is normally a parsed AffineSet (or None if omitted in MLIR).
+    # distributed_tile_access overloads this field with a pre-enumerated
+    # List[Tuple[int, ...]] (the points in C_i = B_i ∩ (x + A)) so that
+    # distributed_load/store can iterate without access context.
+    # TODO: this type-lie is a stopgap.  The affine-set refactor will replace
+    # AffineSet with a proper region type that can represent B_i, C_i, shifts,
+    # intersections, and enumerate cheaply — at which point C_i is just another
+    # region and this field stays typed correctly.
+    coordinate_set: Optional[AffineSet] = None
     partition_origin: Optional[Tuple[int, ...]] = None  # min(B_i) in global coords;
                                                         # set by distributed_tile_access,
                                                         # None on construct_memory_view

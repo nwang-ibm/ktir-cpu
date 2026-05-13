@@ -21,7 +21,7 @@ primitives used by dialect handlers in ``ktir_cpu.dialects``.
 
 from typing import List, Optional, Tuple
 import numpy as np
-from ..affine import AffineMap, AffineSet, box_set
+from ..affine import AffineMap, AffineSet
 from ..dialects.ktdp_helpers import eval_subscript_expr
 from ..dtypes import bytes_per_elem as _bytes_per_elem, to_np_dtype as _to_np_dtype
 from ..ir_types import Tile, TileRef, DistributedTileRef
@@ -338,39 +338,38 @@ class MemoryOps:
         """
         global_base = base_map.eval(indices)
         ndim = len(dist_ref.shape)
+        x = global_base
 
-        # x + A: global footprint of the access tile.
-        # When access_tile_set is None the parser verified A = [0, access_shape),
-        # so x + A = [x, x + access_shape) in global coords.
-        xA = access_tile_set.shift(global_base) if access_tile_set is not None \
-            else box_set(access_shape).shift(global_base)
+        # Membership test for "p ∈ x + A" (local coords A, global footprint x + A).
+        def _in_xA(p: Tuple[int, ...]) -> bool:
+            if access_tile_set is None:
+                return all(0 <= p[d] - x[d] < access_shape[d] for d in range(ndim))
+            return access_tile_set.contains(tuple(p[d] - x[d] for d in range(ndim)))
 
         survivors: List[TileRef] = []
         for part in dist_ref.partitions:
             B_i = part.coordinate_set
-
-            # C_i = (x + A) ∩ B_i — global coords covered by both access tile and partition.
-            C_i = xA.intersect(B_i)
-            C_i_pts = C_i.enumerate(dist_ref.shape)
+            # Enumerate B_i once; compute p_i = min(B_i) and C_i_pts = B_i ∩ (x + A)
+            # in the same pass.
+            B_i_pts = B_i.enumerate(dist_ref.shape)
+            if not B_i_pts:
+                continue
+            p_i = tuple(min(pt[d] for pt in B_i_pts) for d in range(ndim))
+            C_i_pts = [pt for pt in B_i_pts if _in_xA(pt)]
             if not C_i_pts:
                 continue
 
-            # p_i = min(B_i) — global origin of partition i (base_ptr == local [0,...,0]).
-            # TODO: AffineSet can't answer this structurally — enumerate B_i as a
-            # fallback.  Refactor coordinate_sets to a BoxRegion type with O(ndim)
-            # lower_bounds/upper_bounds/intersect/is_empty, falling back to AffineSet
-            # only for genuinely non-box sets.
-            B_i_pts = B_i.enumerate(dist_ref.shape)
-            p_i = tuple(min(pt[d] for pt in B_i_pts) for d in range(ndim))
-
+            # TODO: C_i_pts stored as a point list in `coordinate_set` — not an
+            # AffineSet.  To be replaced by a proper region type in the affine
+            # refactor so this field stays correctly typed.
             survivors.append(TileRef(
                 base_ptr=part.base_ptr,
                 shape=part.shape,
                 strides=part.strides,
                 memory_space=part.memory_space,
                 dtype=part.dtype,
-                coordinate_set=C_i,   # global coordinates
-                partition_origin=p_i, # global coordinates
+                coordinate_set=C_i_pts,  # type: ignore[arg-type]
+                partition_origin=p_i,
             ))
 
         if not survivors:
@@ -405,9 +404,9 @@ class MemoryOps:
         total_unique_sticks = 0
 
         for part in dist_ref.partitions:
-            # C_i = part.coordinate_set (set by distributed_tile_access, global coords)
-            # p_i = part.partition_origin (global origin of partition, base_ptr == local [0,0])
-            C_i_pts = part.coordinate_set.enumerate(dist_ref.shape)
+            # coordinate_set holds C_i_pts (List[Tuple[int,...]]) here — see
+            # distributed_tile_access.  TODO: fix typing in the affine refactor.
+            C_i_pts = part.coordinate_set
             p_i = part.partition_origin
             x = global_base
 
@@ -441,7 +440,9 @@ class MemoryOps:
         global_base = dist_ref.global_base or (0,) * ndim
 
         for part in dist_ref.partitions:
-            C_i_pts = part.coordinate_set.enumerate(dist_ref.shape)
+            # coordinate_set holds C_i_pts (List[Tuple[int,...]]) here — see
+            # distributed_tile_access.  TODO: fix typing in the affine refactor.
+            C_i_pts = part.coordinate_set
             p_i = part.partition_origin
             x = global_base
 
