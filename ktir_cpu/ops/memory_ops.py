@@ -43,6 +43,7 @@ class MemoryOps:
         memory_space: str,
         dtype: str = "f16",
         coordinate_set: Optional[str] = None,
+        lx_core_id: Optional[int] = None,
     ) -> TileRef:
         """Create a memory layout descriptor (TileRef).
 
@@ -56,6 +57,9 @@ class MemoryOps:
             memory_space: "HBM" or "LX"
             dtype: Data type
             coordinate_set: Verbatim affine_set string, no evaluation
+            lx_core_id: Core index for LX partitions tagged with
+                ``#ktdp.spyre_memory_space<LX, core = N>``.  None means
+                the executing core's own scratchpad.
 
         Returns:
             TileRef describing the memory layout
@@ -67,6 +71,7 @@ class MemoryOps:
             memory_space=memory_space,
             dtype=dtype,
             coordinate_set=coordinate_set,
+            lx_core_id=lx_core_id,
         )
 
     @staticmethod
@@ -104,7 +109,8 @@ class MemoryOps:
             shape=access_shape,
             strides=parent_ref.strides,
             memory_space=parent_ref.memory_space,
-            dtype=parent_ref.dtype
+            dtype=parent_ref.dtype,
+            lx_core_id=parent_ref.lx_core_id,
         )
 
     @staticmethod
@@ -208,7 +214,7 @@ class MemoryOps:
         Returns:
             Tile value (tensor) loaded into LX
         """
-        mem = context.hbm if tile_ref.memory_space == "HBM" else context.lx
+        mem = context.hbm if tile_ref.memory_space == "HBM" else context.get_lx(tile_ref.lx_core_id)
 
         # Fast path: contiguous tile, no coord filtering — single dict-key read.
         if coords is None and MemoryOps._is_contiguous(tile_ref.shape, tile_ref.strides):
@@ -262,7 +268,7 @@ class MemoryOps:
             tile_ref: Tile reference (memref) describing destination
             coords: Optional list of local coordinate tuples to scatter into.
         """
-        mem = context.hbm if tile_ref.memory_space == "HBM" else context.lx
+        mem = context.hbm if tile_ref.memory_space == "HBM" else context.get_lx(tile_ref.lx_core_id)
 
         # Fast path: contiguous tile, no coord filtering — single dict-key write.
         if coords is None and MemoryOps._is_contiguous(tile_ref.shape, tile_ref.strides):
@@ -388,6 +394,7 @@ class MemoryOps:
                 dtype=part.dtype,
                 coordinate_set=coordinate_set_out,
                 partition_origin=p_i,
+                lx_core_id=part.lx_core_id,
             ))
 
         if not survivors:
@@ -426,6 +433,7 @@ class MemoryOps:
             strides=list(part.strides),
             memory_space=part.memory_space,
             dtype=part.dtype,
+            lx_core_id=part.lx_core_id,
         )
 
     @staticmethod
@@ -559,7 +567,7 @@ class MemoryOps:
                     idx_coords = tuple(
                         eval_subscript_expr(e, pt) for e in sub["idx_exprs"]
                     )
-                    mem = context.hbm if idx_view.memory_space == "HBM" else context.lx
+                    mem = context.hbm if idx_view.memory_space == "HBM" else context.get_lx(idx_view.lx_core_id)
                     offset = sum(c * s for c, s in zip(idx_coords, idx_view.strides))
                     addr = idx_view.base_ptr + offset * _bytes_per_elem(idx_view.dtype)
                     raw = mem.read(addr, 1, idx_view.dtype)

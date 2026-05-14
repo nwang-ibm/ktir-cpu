@@ -30,7 +30,7 @@
 #var_space_order = affine_map<(d0, d1) -> (d0, d1)>
 
 module {
-  func.func @distributed_view_copy() {
+  func.func @distributed_view_copy() attributes { grid = [2, 1, 1] } {
 
         %c0 = arith.constant 0 : index
 

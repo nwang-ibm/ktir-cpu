@@ -498,12 +498,6 @@ def _seed_and_run(spec: DistCopySpec) -> Tuple[np.ndarray, np.ndarray]:
 # RFC example (xfail: per-core LX routing not yet implemented)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(
-    reason="Interpreter gap: LX memory is not per-core; simulator ignores core=N "
-           "routing so LX partitions from different cores share one scratchpad and "
-           "reads return zeros instead of the seeded data.",
-    strict=True,
-)
 @pytest.mark.parametrize("path,func_name,entry", get_test_params("distributed_view_copy"))
 def test_distributed_view_copy_rfc(path, func_name, entry):
     """construct_distributed_memory_view — RFC §C.3 example file.
@@ -522,11 +516,18 @@ def test_distributed_view_copy_rfc(path, func_name, entry):
         _orig(grid_shape)
         hbm = interp.memory.hbm
         lx0 = interp.memory.get_lx(0)
+        lx1 = interp.memory.get_lx(1)
         full = np.arange(192 * 64, dtype=np.float16).reshape(192, 64)
         hbm.write(0, full[0:96, :].flatten())
         _write_strided(lx0, 12288, full[96:128, :].copy(), strides=[1, 64])
-        lx0.write(16384, full[128:192, :].flatten())
+        lx1.write(16384, full[128:192, :].flatten())
         hbm.write(24576, np.zeros(192 * 64, dtype=np.float16))
+        # Advance each LX next_ptr past its seeded region so that _write_to_lx
+        # staging (which bumps from next_ptr upward) does not overwrite source data.
+        # lx0 seeded at 12288, col-packed span = 31 + 63*64 + 1 = 4064 elems = 8128 bytes
+        # lx1 seeded at 16384, row-major span = 64*64 = 4096 elems = 8192 bytes
+        lx0.next_ptr = 12288 + 8128
+        lx1.next_ptr = 16384 + 8192
 
     interp._prepare_execution = _prepare_and_seed
     interp.execute_function(func_name)

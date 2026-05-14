@@ -107,12 +107,19 @@ class TileRef:
     partition_origin: Optional[Tuple[int, ...]] = None  # min(B_i) in global coords;
                                                         # set by distributed_tile_access,
                                                         # None on construct_memory_view
+    lx_core_id: Optional[int] = None  # set when memory_space="LX" and a core index
+                                      # was specified via #ktdp.spyre_memory_space<LX, core = N>
 
     def __post_init__(self):
         valid = ("HBM", "LX")
         if self.memory_space not in valid:
             raise ValueError(
                 f"Invalid memory_space {self.memory_space!r}. Must be one of {valid}."
+            )
+        if self.lx_core_id is not None and self.memory_space != "LX":
+            raise ValueError(
+                f"lx_core_id may only be set when memory_space is 'LX', "
+                f"got memory_space={self.memory_space!r}"
             )
 
     def size_bytes(self) -> int:

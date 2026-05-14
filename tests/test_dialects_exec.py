@@ -29,7 +29,6 @@ from ktir_cpu.ir_types import Operation, Tile
 from ktir_cpu.grid import CoreContext, GridExecutor
 from ktir_cpu.memory import HBMSimulator, LXScratchpad, SpyreMemoryHierarchy
 from ktir_cpu.dialects.registry import dispatch, ExecutionEnv
-from ktir_cpu.ops.comm_ops import RingNetwork
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -55,18 +54,31 @@ def _make_ctx(grid_pos=(0, 0, 0), core_id=0):
     )
 
 
-def _make_env(grid_shape=(1, 1, 1)):
-    memory = SpyreMemoryHierarchy(num_cores=1)
-    grid = GridExecutor(grid_shape=grid_shape, memory=memory)
-    ring = RingNetwork(num_cores=1)
-
+def _make_execute_region(env):
+    """Build an execute_region callable that dispatches Operation objects via env."""
     def execute_region(context, ops):
         result = None
         for op in ops:
-            result = op(context)
+            handler = dispatch(op.op_type)
+            if handler is None:
+                raise ValueError(f"Unknown operation: {op.op_type}")
+            result = handler(op, context, env)
+            if op.result is not None and result is not None:
+                if isinstance(op.result, list) and isinstance(result, tuple):
+                    for name, val in zip(op.result, result):
+                        context.set_value(name, val)
+                else:
+                    context.set_value(op.result, result)
         return result
+    return execute_region
 
-    return ExecutionEnv(grid_executor=grid, ring=ring, execute_region=execute_region)
+
+def _make_env(grid_shape=(1, 1, 1)):
+    memory = SpyreMemoryHierarchy(num_cores=1)
+    grid = GridExecutor(grid_shape=grid_shape, memory=memory)
+    env = ExecutionEnv(grid_executor=grid, ring_backend=None, execute_region=None)
+    env.execute_region = _make_execute_region(env)
+    return env
 
 
 def _call(op_type, context, env, **op_kwargs):
@@ -646,15 +658,6 @@ class TestLinalg:
 
         # Use the real dispatcher for region execution
         env = _make_env()
-        def _exec_region(context, ops):
-            result = None
-            for region_op in ops:
-                handler = dispatch(region_op.op_type)
-                result = handler(region_op, context, env)
-                if region_op.result and result is not None:
-                    context.set_value(region_op.result, result)
-            return result
-        env.execute_region = _exec_region
 
         # Region body (as Operation objects the dispatcher can execute):
         #   %sum = arith.addf %in_arg, %out_arg
@@ -746,27 +749,10 @@ class TestTensor:
 # ---------------------------------------------------------------------------
 
 class TestTensorGenerate:
-    def _exec_env(self):
-        # tensor.generate calls env.execute_region(context, body) for each index
-        # combination.  The default _make_env().execute_region expects callables,
-        # but we pass Operation objects.  Override it to dispatch each op through
-        # the real handler registry (same pattern as test_generic_reads_outs_arg).
-        env = _make_env()
-        def _exec_region(context, ops):
-            result = None
-            for region_op in ops:
-                handler = dispatch(region_op.op_type)
-                result = handler(region_op, context, env)
-                if region_op.result and result is not None:
-                    context.set_value(region_op.result, result)
-            return result
-        env.execute_region = _exec_region
-        return env
-
     def test_generate_1d(self):
         ctx = _make_ctx()
         ctx.set_value("%c2", 2)
-        env = self._exec_env()
+        env = _make_env()
         region = [
             _op("region.bb0_args", operands=[], attributes={"names": ["%i"]}),
             _op("arith.muli", operands=["%i", "%c2"], result="%val"),
@@ -782,7 +768,7 @@ class TestTensorGenerate:
 
     def test_generate_2d(self):
         ctx = _make_ctx()
-        env = self._exec_env()
+        env = _make_env()
         region = [
             _op("region.bb0_args", operands=[], attributes={"names": ["%i", "%j"]}),
             _op("arith.cmpi", operands=["%i", "%j"],

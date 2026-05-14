@@ -26,7 +26,7 @@ from .ir_types import Operation, IRModule, Tile
 from .parser import KTIRParser, KTIRParserBase
 from .memory import SpyreMemoryHierarchy
 from .grid import GridExecutor, CoreContext
-from .ops.comm_ops import RingNetwork
+from .ops.comm_ops import RingNetwork, DirectLXBackend
 from .latency import HardwareConfig, LatencyTracker, LatencyReport
 from .dialects import dispatch, ExecutionEnv
 
@@ -94,11 +94,16 @@ class KTIRInterpreter:
         """
         num_cores = grid_shape[0] * grid_shape[1] * grid_shape[2]
         self.memory = SpyreMemoryHierarchy(num_cores)
-        self.grid_executor = GridExecutor(grid_shape, self.memory)
         self.ring_network = RingNetwork(num_cores)
+        # First-pass backend: direct scratchpad lookup, no ring latency modelling.
+        # Replace with RingTransferBackend(self.memory, self.ring_network) when
+        # the coroutine-based scheduler lands to model actual ring hop cost and
+        # correct cyclic communication.  See gap_analysis.md gaps K1/K2.
+        self.ring_backend = DirectLXBackend(self.memory)
+        self.grid_executor = GridExecutor(grid_shape, self.memory, self.ring_backend)
         self._env = ExecutionEnv(
             grid_executor=self.grid_executor,
-            ring=self.ring_network,
+            ring_backend=self.ring_backend,
             execute_region=self.execute_region,
         )
         if self._latency_tracker is not None:
@@ -152,19 +157,18 @@ class KTIRInterpreter:
                 input_ptrs[arg_name] = tensor
 
         # Execute on all cores
-        def execute_on_core(core: CoreContext, ring: RingNetwork):
+        def execute_on_core(core: CoreContext):
             # Initialize context with function arguments
             for arg_name, arg_val in input_ptrs.items():
                 core.set_value("%" + arg_name, arg_val)
 
             # Execute function body
             for op in func.operations:
-                self._execute_operation(op, core, ring)
+                self._execute_operation(op, core)
 
         # Execute with communication support
         self.grid_executor.execute_with_communication(
             execute_on_core,
-            self.ring_network,
             max_rounds=10
         )
 
@@ -179,7 +183,7 @@ class KTIRInterpreter:
 
         return outputs
 
-    def _execute_operation(self, op: Operation, context: CoreContext, ring: RingNetwork) -> Any:
+    def _execute_operation(self, op: Operation, context: CoreContext) -> Any:
         """Execute a single operation.
 
         Args:
@@ -278,5 +282,5 @@ class KTIRInterpreter:
         """
         result = None
         for op in operations:
-            result = self._execute_operation(op, context, self.ring_network)
+            result = self._execute_operation(op, context)
         return result
