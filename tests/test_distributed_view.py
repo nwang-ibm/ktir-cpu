@@ -67,24 +67,6 @@ def _get_mem(interp, space: str):
 # MLIR builder
 # ---------------------------------------------------------------------------
 
-def _affine_set_rows(r0: int, r1: int, c0: int, c1: int) -> str:
-    """Return affine_set string covering rows r0..r1, cols c0..c1 (inclusive)."""
-    return (
-        f"affine_set<(d0, d1) : "
-        f"(d0 - {r0} >= 0, -{r0} + {r1} - d0 + {r0} >= 0, "
-        f"d1 - {c0} >= 0, -{c0} + {c1} - d1 + {c0} >= 0)>"
-    ).replace("(d0 - 0 >= 0", "(d0 >= 0").replace("(d1 - 0 >= 0", "(d1 >= 0")
-
-
-def _set_rows(r0: int, r1: int, ncols: int) -> str:
-    """affine_set covering rows [r0, r1] and all cols [0, ncols-1]."""
-    row_lo = f"d0 - {r0} >= 0" if r0 > 0 else "d0 >= 0"
-    row_hi = f"-d0 + {r1} >= 0"
-    col_lo = "d1 >= 0"
-    col_hi = f"-d1 + {ncols - 1} >= 0"
-    return f"affine_set<(d0, d1) : ({row_lo}, {row_hi}, {col_lo}, {col_hi})>"
-
-
 def _set_box(r0: int, r1: int, c0: int, c1: int) -> str:
     """affine_set covering [r0,r1] x [c0,c1] (all inclusive)."""
     parts = []
