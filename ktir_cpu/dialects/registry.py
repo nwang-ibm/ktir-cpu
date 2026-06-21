@@ -115,6 +115,25 @@ def dispatch(op_name: str) -> Optional[HandlerFn]:
     return _REGISTRY.get(op_name)
 
 
+def temp_registry():
+    """Context manager that restores _REGISTRY and _LATENCY_CATEGORIES on exit."""
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _ctx():
+        saved_registry = _REGISTRY.copy()
+        saved_latency = _LATENCY_CATEGORIES.copy()
+        try:
+            yield
+        finally:
+            _REGISTRY.clear()
+            _REGISTRY.update(saved_registry)
+            _LATENCY_CATEGORIES.clear()
+            _LATENCY_CATEGORIES.update(saved_latency)
+
+    return _ctx()
+
+
 @dataclass
 class ParseContext:
     """Parse-time context passed to dialect parsers alongside the op text.

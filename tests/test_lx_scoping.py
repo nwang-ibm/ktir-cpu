@@ -1193,3 +1193,280 @@ class TestLastUseMatmulKernel:
         ctx.set_value("%accum_next", _make_tile((384, 512)))
         assert ctx.lx.used == N
 
+
+# ---------------------------------------------------------------------------
+# Fused matmul / batch_matmul: outs = accumulator iter_arg (issue #135)
+# ---------------------------------------------------------------------------
+
+# Fused matmul kernel: linalg.matmul outs(%accum_itr) directly yields the
+# result as %accum_next. No separate arith.addf — the accumulator IS the outs.
+# BM=64, BN=32, BK=16, K=64 (4 iterations).
+# Accumulator = 64*32*2 = 4096 bytes.
+# If the handler creates a new Tile, peak = 3*4096 = 12288 bytes (overcounted).
+# With in-place fix, peak = 1*4096 + loads = 4096 + 2048 + 1024 = 7168 bytes.
+FUSED_MATMUL_MLIR = """
+module {
+  func.func @fused_matmul_test(
+      %a_ptr: index, %b_ptr: index, %c_ptr: index,
+      %K: index, %BM: index, %BN: index, %BK: index
+  ) attributes {grid = [1]} {
+    %pid_m, %pid_n = ktdp.get_compute_tile_id : index, index
+
+    %a_view = ktdp.construct_memory_view %a_ptr, sizes: [64, 64], strides: [64, 1] {
+      coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
+      memory_space = #ktdp.spyre_memory_space<HBM>
+    } : memref<64x64xf16>
+
+    %b_view = ktdp.construct_memory_view %b_ptr, sizes: [64, 32], strides: [32, 1] {
+      coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 31 >= 0)>,
+      memory_space = #ktdp.spyre_memory_space<HBM>
+    } : memref<64x32xf16>
+
+    %c_view = ktdp.construct_memory_view %c_ptr, sizes: [64, 32], strides: [32, 1] {
+      coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 31 >= 0)>,
+      memory_space = #ktdp.spyre_memory_space<HBM>
+    } : memref<64x32xf16>
+
+    %c0 = arith.constant 0 : index
+    %accum_zero = arith.constant dense<0.0> : tensor<64x32xf16>
+
+    %c = scf.for %off_k = %c0 to %K step %BK iter_args(%accum_itr = %accum_zero) -> (tensor<64x32xf16>) {
+      %a_acc = ktdp.construct_access_tile %a_view[%pid_m, %off_k] {
+        access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 15 >= 0)>,
+        access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
+      } : memref<64x64xf16> -> !ktdp.access_tile<64x16xindex>
+
+      %b_acc = ktdp.construct_access_tile %b_view[%off_k, %pid_n] {
+        access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 15 >= 0, d1 >= 0, -d1 + 31 >= 0)>,
+        access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
+      } : memref<64x32xf16> -> !ktdp.access_tile<16x32xindex>
+
+      %a = ktdp.load %a_acc : !ktdp.access_tile<64x16xindex> -> tensor<64x16xf16>
+      %b = ktdp.load %b_acc : !ktdp.access_tile<16x32xindex> -> tensor<16x32xf16>
+
+      %accum_next = linalg.matmul ins(%a, %b : tensor<64x16xf16>, tensor<16x32xf16>)
+                                  outs(%accum_itr : tensor<64x32xf16>) -> tensor<64x32xf16>
+
+      scf.yield %accum_next : tensor<64x32xf16>
+    }
+
+    %c_acc = ktdp.construct_access_tile %c_view[%pid_m, %pid_n] {
+      access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 31 >= 0)>,
+      access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
+    } : memref<64x32xf16> -> !ktdp.access_tile<64x32xindex>
+
+    ktdp.store %c, %c_acc : tensor<64x32xf16>, !ktdp.access_tile<64x32xindex>
+    return
+  }
+}
+"""
+
+
+
+class TestFusedMatmulLX:
+    """Issue #135: fused matmul outs(%accum_itr) must not overcount LX.
+
+    When the handler returns the same Tile object as outs, alias_dedup sees
+    one refcount key for %accum_itr and %accum_next — LX is charged once.
+
+    Tile sizes (f16 = 2 bytes/elem):
+        accumulator  64×32×2 = 4096 bytes
+        %a           64×16×2 = 2048 bytes
+        %b           16×32×2 = 1024 bytes
+
+    With in-place fix (dedup on): peak = accum + a + b = 7168 bytes.
+    Without fix (3x overcount): peak = 3*4096 + 2048 + 1024 = 15360 bytes.
+
+    LX cap set to 10240 bytes — passes with fix, overflows without.
+    """
+
+    LX_CAP = 10240  # 10 KB — fits if accum charged once, overflows if 3x
+
+    def _run_fused_matmul(self, lx_options):
+        from ktir_cpu.interpreter import KTIRInterpreter
+
+        cap = TestFusedMatmulLX.LX_CAP
+
+        class _Patched(KTIRInterpreter):
+            def _prepare_execution(self, grid_shape):
+                super()._prepare_execution(grid_shape)
+                for core in self.grid_executor.cores:
+                    core.lx.capacity = cap
+                    core.lx_options = lx_options
+
+        BM, BN, BK, K = 64, 32, 16, 64
+        a = np.random.rand(BM, K).astype(np.float16)
+        b = np.random.rand(K, BN).astype(np.float16)
+        c = np.zeros((BM, BN), dtype=np.float16)
+        interp = _Patched()
+        interp.load(FUSED_MATMUL_MLIR)
+        interp.execute_function(
+            "fused_matmul_test", a_ptr=a, b_ptr=b, c_ptr=c,
+            K=K, BM=BM, BN=BN, BK=BK,
+        )
+
+    def test_fused_matmul_fits_with_dedup(self):
+        """With alias_dedup + in-place fix, fused matmul fits in tight LX."""
+        self._run_fused_matmul(_LX_DEDUP)  # must not raise
+
+    def test_fused_matmul_fits_with_full(self):
+        """With full LX tracking + in-place fix, fused matmul fits."""
+        self._run_fused_matmul(_LX_FULL)  # must not raise
+
+
+class TestFusedBatchMatmulLX:
+    """Issue #135: batch_matmul in-place fix — unit-level LX verification.
+
+    Directly exercises the handler's alias behavior through CoreContext
+    without full HBM simulation (3D access tiles are complex to set up).
+
+    Simulates 2 iterations of:
+        %accum_next = linalg.batch_matmul ins(%a, %b) outs(%accum_itr)
+        scf.yield %accum_next
+
+    With in-place fix: %accum_next is the same object as %accum_itr,
+    so alias_dedup charges LX only once for the accumulator.
+    """
+
+    def test_batch_matmul_returns_same_object(self):
+        """Handler returns the same Tile as outs — alias chain preserved."""
+        from ktir_cpu.dialects.linalg_ops import linalg__batch_matmul
+        from ktir_cpu.ir_types import Operation
+
+        ctx = _make_context(lx_options=_LX_DEDUP)
+        a_tile = Tile(np.ones((2, 4, 3), dtype=np.float16), "f16", (2, 4, 3))
+        b_tile = Tile(np.ones((2, 3, 5), dtype=np.float16), "f16", (2, 3, 5))
+        acc_tile = Tile(np.zeros((2, 4, 5), dtype=np.float16), "f16", (2, 4, 5))
+
+        ctx.set_value("%a", a_tile)
+        ctx.set_value("%b", b_tile)
+        ctx.set_value("%acc", acc_tile)
+
+        op = Operation(
+            result="%r", op_type="linalg.batch_matmul",
+            operands=["%a", "%b", "%acc"], attributes={},
+            result_type="tensor<2x4x5xf16>",
+            outs_operands=["%acc"],
+        )
+
+        result = linalg__batch_matmul(op, ctx, None)
+        assert result is acc_tile, "batch_matmul must return same object as outs"
+
+    def test_batch_matmul_lx_not_overcounted(self):
+        """Simulated loop: alias_dedup charges accumulator once, not 3x."""
+        ctx = _make_context(lx_options=_LX_DEDUP)
+
+        # Simulate: %accum_zero bound in parent scope
+        accum = Tile(np.zeros((2, 4, 5), dtype=np.float16), "f16", (2, 4, 5))
+        accum_bytes = accum.size_bytes()  # 2*4*5*2 = 80
+        ctx.set_value("%accum_itr", accum)
+        assert ctx.lx.used == accum_bytes
+
+        # Iteration 1: bind %accum_next to same object (in-place result)
+        ctx.set_value("%accum_next", accum)  # same id → refcount++, no new charge
+        assert ctx.lx.used == accum_bytes, (
+            f"LX overcounted: {ctx.lx.used} != {accum_bytes}"
+        )
+
+        # Rebind iter_arg: %accum_itr = %accum_next (same object)
+        ctx.set_value("%accum_itr", accum)
+        assert ctx.lx.used == accum_bytes
+
+    def test_batch_matmul_correctness(self):
+        """batch_matmul produces correct numerical result."""
+        from ktir_cpu.dialects.linalg_ops import linalg__batch_matmul
+        from ktir_cpu.ir_types import Operation
+
+        ctx = _make_context(lx_options=_LX_DEDUP)
+        a_data = np.ones((2, 4, 3), dtype=np.float16) * 2
+        b_data = np.ones((2, 3, 5), dtype=np.float16) * 3
+        acc_data = np.ones((2, 4, 5), dtype=np.float16)
+
+        ctx.set_value("%a", Tile(a_data, "f16", (2, 4, 3)))
+        ctx.set_value("%b", Tile(b_data, "f16", (2, 3, 5)))
+        acc_tile = Tile(acc_data, "f16", (2, 4, 5))
+        ctx.set_value("%acc", acc_tile)
+
+        op = Operation(
+            result="%r", op_type="linalg.batch_matmul",
+            operands=["%a", "%b", "%acc"], attributes={},
+            result_type="tensor<2x4x5xf16>",
+            outs_operands=["%acc"],
+        )
+
+        result = linalg__batch_matmul(op, ctx, None)
+        # Expected: acc + a @ b = 1 + 2*3*3 = 19 (each element)
+        expected = np.full((2, 4, 5), 19.0, dtype=np.float16)
+        np.testing.assert_array_equal(result.data, expected)
+
+
+class TestOutsStructuralAssertion:
+    """Verify the structural outs-invariant assertion fires on violations."""
+
+    def test_assertion_catches_new_tile(self):
+        """A handler that returns a new Tile instead of mutating outs triggers assert."""
+        from ktir_cpu.interpreter import KTIRInterpreter
+        from ktir_cpu.ir_types import Operation
+        from ktir_cpu.dialects.registry import register, temp_registry
+
+        with temp_registry():
+            @register("test.broken_matmul", latency_category=None)
+            def broken_handler(op, context, env):
+                acc = context.get_value(op.operands[2])
+                if isinstance(acc, Tile):
+                    return Tile(acc.data.copy(), acc.dtype, acc.shape)  # NEW object!
+                return Tile(np.zeros((4, 4), dtype=np.float16), "f16", (4, 4))
+
+            op = Operation(
+                result="%r",
+                op_type="test.broken_matmul",
+                operands=["%a", "%b", "%c"],
+                attributes={},
+                result_type="tensor<4x4xf16>",
+                outs_operands=["%c"],
+            )
+
+            ctx = _make_context(lx_options=_LX_DEDUP)
+            ctx.set_value("%a", _make_tile((4, 4)))
+            ctx.set_value("%b", _make_tile((4, 4)))
+            ctx.set_value("%c", _make_tile((4, 4)))
+
+            interp = KTIRInterpreter()
+            interp.load('module { func.func @dummy() attributes {grid = [1]} { return } }')
+
+            with pytest.raises(AssertionError, match="handler returned new Tile"):
+                interp._execute_op(op, ctx)
+
+    def test_no_assertion_for_correct_handler(self):
+        """A handler that returns the same outs object does not trigger."""
+        from ktir_cpu.interpreter import KTIRInterpreter
+        from ktir_cpu.ir_types import Operation
+        from ktir_cpu.dialects.registry import register, temp_registry
+
+        with temp_registry():
+            @register("test.correct_matmul", latency_category=None)
+            def correct_handler(op, context, env):
+                acc = context.get_value(op.operands[2])
+                if isinstance(acc, Tile):
+                    acc.data += 1.0  # in-place
+                    return acc       # same object
+                return Tile(np.zeros((4, 4), dtype=np.float16), "f16", (4, 4))
+
+            op = Operation(
+                result="%r",
+                op_type="test.correct_matmul",
+                operands=["%a", "%b", "%c"],
+                attributes={},
+                result_type="tensor<4x4xf16>",
+                outs_operands=["%c"],
+            )
+
+            ctx = _make_context(lx_options=_LX_DEDUP)
+            ctx.set_value("%a", _make_tile((4, 4)))
+            ctx.set_value("%b", _make_tile((4, 4)))
+            ctx.set_value("%c", _make_tile((4, 4)))
+
+            interp = KTIRInterpreter()
+            interp.load('module { func.func @dummy() attributes {grid = [1]} { return } }')
+            interp._execute_op(op, ctx)  # must not raise
+

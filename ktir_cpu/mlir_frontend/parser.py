@@ -133,6 +133,8 @@ class MLIRTypeAdapter:
             )
         handler(mlir_op, attributes, result_type, operands)
 
+        outs_operands = attributes.pop("_outs_operands", [])
+
         return Operation(
             result=result,
             op_type=mlir_op.name,
@@ -140,6 +142,7 @@ class MLIRTypeAdapter:
             attributes=attributes,
             result_type=result_type,
             regions=regions,
+            outs_operands=outs_operands,
         )
 
     def adapt_block(self, block) -> List[Operation]:
@@ -158,8 +161,6 @@ MLIRTypeAdapter.install(
     "func.return",
     "linalg.add",
     "linalg.fill",
-    "linalg.matmul",
-    "linalg.batch_matmul",
     "linalg.yield",
     "scf.yield",
     "scf.if",
@@ -218,6 +219,24 @@ MLIRTypeAdapter.install(
     # emitted by the bindings walk but not present in text IR
     "ktdp.region_terminator",
 )(_no_attrs)
+
+
+def _adapt_linalg_matmul_like(mlir_op, attributes, result_type, operands):
+    """Handler for linalg.matmul/batch_matmul: fixed 2 ins, 1 outs.
+
+    Populates _outs_operands so the structural assertion in _execute_op can
+    verify the handler returns the same Tile object as outs (in-place invariant).
+    If a future op has the same accumulate-into-outs semantics (e.g. linalg.conv),
+    add it to the MLIRTypeAdapter.install() call below.
+    """
+    if len(operands) > 2:
+        attributes["_outs_operands"] = operands[2:]
+
+
+MLIRTypeAdapter.install(
+    "linalg.matmul",
+    "linalg.batch_matmul",
+)(_adapt_linalg_matmul_like)
 
 
 @MLIRTypeAdapter.install("scf.for")

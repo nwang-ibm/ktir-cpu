@@ -620,12 +620,19 @@ class KTIRParser(KTIRParserBase):
                 attributes["_result_shape"] = type_info["shape"]
                 attributes["_result_dtype"] = type_info.get("dtype", "f16")
 
+        outs_ops = []
+        if op_type in ("linalg.matmul", "linalg.batch_matmul"):
+            outs_match = re.search(r'\bouts\s*\(([^)]+)\)', rest)
+            if outs_match:
+                outs_ops = find_ssa_names(outs_match.group(1).split(':')[0])
+
         return Operation(
             result=result,
             op_type=op_type,
             operands=operands,
             attributes=attributes,
-            result_type=result_type
+            result_type=result_type,
+            outs_operands=outs_ops,
         )
 
     def _extract_operands(self, text: str, result: Optional[str]) -> List[str]:

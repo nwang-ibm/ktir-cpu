@@ -379,6 +379,7 @@ class Operation:
     attributes: Dict[str, Any]  # Operation attributes
     result_type: Optional[str]  # Result type string
     regions: List[List['Operation']] = field(default_factory=list)  # For control flow
+    outs_operands: List[str] = field(default_factory=list)  # SSA names from outs(...)
 
     def __repr__(self):
         if self.result:
