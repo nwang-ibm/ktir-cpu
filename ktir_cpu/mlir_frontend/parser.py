@@ -222,15 +222,17 @@ MLIRTypeAdapter.install(
 
 
 def _adapt_linalg_matmul_like(mlir_op, attributes, result_type, operands):
-    """Handler for linalg.matmul/batch_matmul: fixed 2 ins, 1 outs.
+    """Handler for linalg.matmul/batch_matmul.
 
     Populates _outs_operands so the structural assertion in _execute_op can
     verify the handler returns the same Tile object as outs (in-place invariant).
     If a future op has the same accumulate-into-outs semantics (e.g. linalg.conv),
     add it to the MLIRTypeAdapter.install() call below.
     """
-    if len(operands) > 2:
-        attributes["_outs_operands"] = operands[2:]
+    from ..parser_utils import extract_outs_operands
+    outs = extract_outs_operands(mlir_op.get_asm())
+    if outs:
+        attributes["_outs_operands"] = outs
 
 
 MLIRTypeAdapter.install(

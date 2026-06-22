@@ -1410,7 +1410,7 @@ class TestOutsStructuralAssertion:
         from ktir_cpu.dialects.registry import register, temp_registry
 
         with temp_registry():
-            @register("test.broken_matmul", latency_category=None)
+            @register("linalg.batch_matmul", latency_category=None)
             def broken_handler(op, context, env):
                 acc = context.get_value(op.operands[2])
                 if isinstance(acc, Tile):
@@ -1419,7 +1419,7 @@ class TestOutsStructuralAssertion:
 
             op = Operation(
                 result="%r",
-                op_type="test.broken_matmul",
+                op_type="linalg.batch_matmul",
                 operands=["%a", "%b", "%c"],
                 attributes={},
                 result_type="tensor<4x4xf16>",
@@ -1444,7 +1444,7 @@ class TestOutsStructuralAssertion:
         from ktir_cpu.dialects.registry import register, temp_registry
 
         with temp_registry():
-            @register("test.correct_matmul", latency_category=None)
+            @register("linalg.matmul", latency_category=None)
             def correct_handler(op, context, env):
                 acc = context.get_value(op.operands[2])
                 if isinstance(acc, Tile):
@@ -1454,7 +1454,7 @@ class TestOutsStructuralAssertion:
 
             op = Operation(
                 result="%r",
-                op_type="test.correct_matmul",
+                op_type="linalg.matmul",
                 operands=["%a", "%b", "%c"],
                 attributes={},
                 result_type="tensor<4x4xf16>",
