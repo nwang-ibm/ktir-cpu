@@ -133,12 +133,10 @@ class MLIRTypeAdapter:
             )
         handler(mlir_op, attributes, result_type, operands)
 
-        outs_operands = attributes.pop("_outs_operands", [])
-        if not outs_operands:
-            from ..dialects.registry import is_inplace_outs
-            if is_inplace_outs(mlir_op.name):
-                from ..parser_utils import extract_outs_operands
-                outs_operands = extract_outs_operands(mlir_op.get_asm())
+        from ..dialects.registry import is_inplace_outs
+        from ..parser_utils import extract_outs_operands
+        outs_operands = (extract_outs_operands(mlir_op.get_asm())
+                         if is_inplace_outs(mlir_op.name) else [])
 
         return Operation(
             result=result,
